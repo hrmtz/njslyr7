@@ -28,9 +28,24 @@ REGISTRY="$FORMATION_DIR/registry.jsonl"
 source "$LIB_DIR/mailbox.sh"
 # shellcheck source=/dev/null
 source "$LIB_DIR/wake.sh"
+# shellcheck source=/dev/null
+source "$LIB_DIR/redact.sh"
 
 mkdir -p "$FORMATION_DIR"
 touch "$REGISTRY"
+
+REFUSE_LOG="$NJSLYR_HOME/mailbox/refuse.log"
+
+refuse_credential() {
+  # $1 = channel (mailbox/msg/briefing), $2 = from_id, $3 = context
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  mkdir -p "$(dirname "$REFUSE_LOG")"
+  printf '%s\t%s\tfrom=%s\t%s\n' "$ts" "$1" "$2" "$3" >> "$REFUSE_LOG"
+  echo "formation: refusing — body matches credential pattern." >&2
+  echo "formation: reference a SOPS-encrypted file instead, e.g." >&2
+  echo "           sops -d config/secrets.enc.yaml | jq -r .key" >&2
+  echo "formation: attempted send logged at $REFUSE_LOG" >&2
+}
 
 self_id() {
   # Identify the caller. Priority: env > tmux pane user-option > pane_id.
@@ -102,8 +117,13 @@ Worker-side commands (invoked by the worker claude via Bash):
   formation ask <question>                Request ack (mailbox + LINE push)
 
 Env:
-  NJSLYR_HOME      default ~/.njslyr
+  NJSLYR_HOME      default ~/.njslyr7
   FORMATION_SELF   override caller id (else tmux @formation_id, else pane-%N)
+
+Credential safety:
+  spawn / msg / report / done / ask all run is_credential_like on their body.
+  Matches exit 3 and append to ~/.njslyr7/mailbox/refuse.log. To send a
+  credential, encrypt it with SOPS and reference the decrypt command.
 
 Remote access:
   Each worker runs its claude with --session-name formation-<id>. Connect from
@@ -116,6 +136,13 @@ cmd_spawn() {
   local briefing="$1" name="${2:-}"
   briefing="$(realpath "$briefing")"
   [[ -f "$briefing" ]] || { echo "briefing not found: $briefing" >&2; exit 2; }
+
+  if is_credential_like "$(cat "$briefing")"; then
+    refuse_credential briefing "$(self_id)" "file=$briefing"
+    echo "formation: the briefing itself contains a credential-shaped string." >&2
+    echo "formation: replace the literal value with a SOPS decrypt command and re-spawn." >&2
+    exit 3
+  fi
 
   if [[ -z "$name" ]]; then
     name="worker-$(date +%s | tail -c 5)"
@@ -148,7 +175,7 @@ cmd_spawn() {
   seed="$(cat <<EOF
 Formation bootstrap. Your worker id is '$name'. Parent pane id is '$parent_id'.
 Briefing: $briefing
-Read it, then use 'bash ~/.njslyr/bin/formation report "<1-line status>"' to acknowledge receipt before starting work. Memory MCP is shared with parent.
+Read it, then run 'formation report "<1-line status>"' to acknowledge receipt before starting work. Memory MCP is shared with parent. Credentials go through SOPS only; the mailbox/msg paths hard-refuse credential-shaped bodies.
 EOF
 )"
   tmux send-keys -t "$pane_id" "$seed" Enter
@@ -161,6 +188,10 @@ cmd_msg() {
   [[ $# -ge 2 ]] || { echo "usage: formation msg <worker_id> <text>" >&2; exit 2; }
   local worker_id="$1"; shift
   local text="$*"
+  if is_credential_like "$text"; then
+    refuse_credential msg "$(self_id)" "to=$worker_id"
+    exit 3
+  fi
   local row; row="$(registry_get "$worker_id")"
   [[ -n "$row" ]] || { echo "no such worker: $worker_id" >&2; exit 2; }
   local pane_id; pane_id="$(echo "$row" | jq -r '.pane_id')"

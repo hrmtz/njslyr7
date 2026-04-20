@@ -123,10 +123,15 @@ a leaked key lives there forever and shows up in every `tail`.
 - Agents reference them by path and command, not by value:
   - ✗ `formation msg worker-1 "use key sk-abc123..."`
   - ✓ `formation msg worker-1 "decrypt with: sops -d config/secrets.enc.yaml | jq -r .openai"`
-- `mailbox_send` will **hard-refuse** bodies matching common secret patterns
-  (`sk-*`, `ghp_*`, `AKIA*`, `*_API_KEY=...`, PEM private keys, etc.) with
-  exit code 3. If you hit that error, re-frame the message around a SOPS
-  decrypt command.
+- `formation msg`, `formation report/done/ask` (mailbox), and `formation
+  spawn` (briefing file content) all run the same credential pattern check
+  and **hard-refuse with exit 3** on match. Patterns covered: `sk-*`,
+  `ghp_*`, `AKIA*`, `*_API_KEY=...`, PEM private keys, long JWTs, etc. The
+  refusal is logged to `~/.njslyr7/mailbox/refuse.log` (timestamp + channel
+  + from-id only; the body itself is NOT logged).
+- If you hit the refusal, re-frame the message around a SOPS decrypt
+  command — do not try to work around the filter by splitting the secret
+  across messages or base64-encoding it.
 - Briefings that require a secret should reference the encrypted file and
   the decrypt command, not embed the secret.
 
@@ -156,9 +161,11 @@ If SOPS is not yet set up for the project, stop and ask the user to do
 
 ## Troubleshooting
 
-- **`mailbox: refusing to send — body matches credential pattern`**: the
-  redaction filter caught something that looks like a secret. Re-phrase the
-  message to reference a SOPS decrypt command instead.
+- **`formation: refusing — body matches credential pattern`**: the
+  redaction filter caught something that looks like a secret in an outgoing
+  mailbox entry, a `msg` text, or a briefing file. Re-phrase around a SOPS
+  decrypt command. Check `~/.njslyr7/mailbox/refuse.log` to confirm which
+  channel tripped it.
 - **Worker pane stuck at claude login prompt**: spawn waited 30s for the `│ >`
   prompt and timed out. Manually complete login in the pane and re-send the
   briefing with `tmux load-buffer -f <briefing> && tmux paste-buffer -t <pane>`.
