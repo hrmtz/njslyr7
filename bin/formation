@@ -1,0 +1,244 @@
+#!/bin/bash
+# formation - spawn and coordinate long-running peer Claude Code panes.
+#
+# A "worker" is a separate tmux pane running its own Claude Code CLI, given
+# a briefing file and an addressable id. Worker reports flow back via an
+# append-only jsonl mailbox. The parent pane (lead) polls `formation inbox`
+# when idle. Phones / external clients reach workers via `/remote-control`
+# using the session-name assigned at spawn.
+#
+# Intended for tasks that justify minutes-to-hours of wall time where Task
+# tool subagents are insufficient (observability, mid-flight redirection,
+# human-in-the-loop acks).
+
+set -euo pipefail
+
+# Resolve real script path (follow symlinks) so lib/ lookup works when this
+# binary is symlinked into ~/.local/bin.
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do SELF="$(readlink -f "$SELF")"; done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+NJSLYR_HOME="${NJSLYR_HOME:-$HOME/.njslyr7}"
+FORMATION_DIR="$NJSLYR_HOME/formation"
+REGISTRY="$FORMATION_DIR/registry.jsonl"
+
+# shellcheck source=/dev/null
+source "$LIB_DIR/mailbox.sh"
+# shellcheck source=/dev/null
+source "$LIB_DIR/wake.sh"
+
+mkdir -p "$FORMATION_DIR"
+touch "$REGISTRY"
+
+self_id() {
+  # Identify the caller. Priority: env > tmux pane user-option > pane_id.
+  if [[ -n "${FORMATION_SELF:-}" ]]; then
+    echo "$FORMATION_SELF"; return
+  fi
+  local opt=""
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    opt="$(tmux display-message -p -t "$TMUX_PANE" '#{@formation_id}' 2>/dev/null || true)"
+  fi
+  if [[ -n "$opt" ]]; then
+    echo "$opt"
+  elif [[ -n "${TMUX_PANE:-}" ]]; then
+    echo "pane-${TMUX_PANE#%}"
+  else
+    echo "shell-$$"
+  fi
+}
+
+line_push() {
+  local msg="$1"
+  local script
+  for script in \
+    "$HOME/projects/multi-agent-njslyr/scripts/line_push.sh" \
+    "$HOME/project/multi-agent-njslyr/scripts/line_push.sh"; do
+    if [[ -x "$script" ]]; then
+      bash "$script" "$msg" >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+  return 0
+}
+
+registry_add() {
+  local worker_id="$1" pane_id="$2" session_name="$3" briefing="$4"
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -cn --arg id "$worker_id" --arg pane "$pane_id" \
+         --arg sess "$session_name" --arg brief "$briefing" --arg ts "$ts" \
+    '{id: $id, pane_id: $pane, session_name: $sess, briefing: $brief, spawned: $ts}' \
+    >> "$REGISTRY"
+}
+
+registry_get() {
+  local worker_id="$1"
+  jq -c --arg id "$worker_id" 'select(.id == $id)' "$REGISTRY" | tail -n1
+}
+
+registry_remove() {
+  local worker_id="$1"
+  local tmp="$REGISTRY.tmp"
+  jq -c --arg id "$worker_id" 'select(.id != $id)' "$REGISTRY" > "$tmp"
+  mv "$tmp" "$REGISTRY"
+}
+
+usage() {
+  cat <<'USAGE'
+formation - long-running peer Claude Code panes
+
+Parent (lead) commands:
+  formation spawn <briefing.md> [name]    Split pane, launch claude, inject briefing
+  formation msg <worker_id> <text>        Send instruction to worker pane
+  formation status                        List active workers and last pane line
+  formation inbox                         Read unread reports addressed to self
+  formation reap <worker_id>              Kill worker pane and drop registry row
+
+Worker-side commands (invoked by the worker claude via Bash):
+  formation report <text>                 Append status to parent mailbox
+  formation done <summary>                Mark finished (mailbox + LINE push)
+  formation ask <question>                Request ack (mailbox + LINE push)
+
+Env:
+  NJSLYR_HOME      default ~/.njslyr
+  FORMATION_SELF   override caller id (else tmux @formation_id, else pane-%N)
+
+Remote access:
+  Each worker runs its claude with --session-name formation-<id>. Connect from
+  phone/web via /remote-control (alias /rc) and attach to that session.
+USAGE
+}
+
+cmd_spawn() {
+  [[ $# -ge 1 ]] || { echo "usage: formation spawn <briefing.md> [name]" >&2; exit 2; }
+  local briefing="$1" name="${2:-}"
+  briefing="$(realpath "$briefing")"
+  [[ -f "$briefing" ]] || { echo "briefing not found: $briefing" >&2; exit 2; }
+
+  if [[ -z "$name" ]]; then
+    name="worker-$(date +%s | tail -c 5)"
+  fi
+  if registry_get "$name" | grep -q .; then
+    echo "worker already exists: $name" >&2; exit 2
+  fi
+
+  local parent_id; parent_id="$(self_id)"
+  local pane_id session_name="formation-$name"
+  pane_id="$(tmux split-window -d -P -F '#{pane_id}' \
+              -e "FORMATION_SELF=$name" -e "FORMATION_PARENT=$parent_id")"
+
+  tmux set-option -p -t "$pane_id" @formation_id "$name" >/dev/null
+  tmux select-pane -t "$pane_id" -T "$name"
+
+  tmux send-keys -t "$pane_id" "claude --session-name $session_name" Enter
+
+  # Wait for claude prompt. Poll up to 30s.
+  local i
+  for i in $(seq 1 30); do
+    sleep 1
+    if tmux capture-pane -p -t "$pane_id" | grep -q '│ >'; then
+      break
+    fi
+  done
+
+  # Seed prompt: identity + briefing reference + immediate action.
+  local seed
+  seed="$(cat <<EOF
+Formation bootstrap. Your worker id is '$name'. Parent pane id is '$parent_id'.
+Briefing: $briefing
+Read it, then use 'bash ~/.njslyr/bin/formation report "<1-line status>"' to acknowledge receipt before starting work. Memory MCP is shared with parent.
+EOF
+)"
+  tmux send-keys -t "$pane_id" "$seed" Enter
+
+  registry_add "$name" "$pane_id" "$session_name" "$briefing"
+  echo "$name  pane=$pane_id  session=$session_name"
+}
+
+cmd_msg() {
+  [[ $# -ge 2 ]] || { echo "usage: formation msg <worker_id> <text>" >&2; exit 2; }
+  local worker_id="$1"; shift
+  local text="$*"
+  local row; row="$(registry_get "$worker_id")"
+  [[ -n "$row" ]] || { echo "no such worker: $worker_id" >&2; exit 2; }
+  local pane_id; pane_id="$(echo "$row" | jq -r '.pane_id')"
+  tmux send-keys -t "$pane_id" "$text" Enter
+}
+
+cmd_status() {
+  if [[ ! -s "$REGISTRY" ]]; then
+    echo "(no workers)"; return
+  fi
+  while IFS= read -r row; do
+    local id pane last
+    id="$(echo "$row" | jq -r '.id')"
+    pane="$(echo "$row" | jq -r '.pane_id')"
+    last="$(tmux capture-pane -p -t "$pane" 2>/dev/null | sed '/^$/d' | tail -n1)"
+    printf '%-20s %-8s  %s\n' "$id" "$pane" "${last:-(pane closed)}"
+  done < "$REGISTRY"
+}
+
+cmd_inbox() {
+  local self; self="$(self_id)"
+  local unread
+  unread="$(mailbox_read "$self")"
+  if [[ -z "$unread" ]]; then
+    echo "(empty)"
+    return
+  fi
+  echo "$unread" | jq -r '"[\(.seq)] \(.ts) from:\(.from)\n  \(.body)\n"'
+  mailbox_mark_read "$self"
+}
+
+cmd_reap() {
+  [[ $# -ge 1 ]] || { echo "usage: formation reap <worker_id>" >&2; exit 2; }
+  local worker_id="$1"
+  local row; row="$(registry_get "$worker_id")"
+  [[ -n "$row" ]] || { echo "no such worker: $worker_id" >&2; exit 2; }
+  local pane_id; pane_id="$(echo "$row" | jq -r '.pane_id')"
+  tmux kill-pane -t "$pane_id" 2>/dev/null || true
+  registry_remove "$worker_id"
+  rm -f "$MAILBOX_CURSOR_DIR/$worker_id.txt"
+  echo "reaped $worker_id"
+}
+
+cmd_report() {
+  [[ $# -ge 1 ]] || { echo "usage: formation report <text>" >&2; exit 2; }
+  local from; from="$(self_id)"
+  local to="${FORMATION_PARENT:-lead}"
+  mailbox_send "$from" "$to" "$*"
+}
+
+cmd_done() {
+  [[ $# -ge 1 ]] || { echo "usage: formation done <summary>" >&2; exit 2; }
+  local from; from="$(self_id)"
+  local to="${FORMATION_PARENT:-lead}"
+  local msg="[DONE] $*"
+  mailbox_send "$from" "$to" "$msg"
+  line_push "[formation/$from] $msg"
+}
+
+cmd_ask() {
+  [[ $# -ge 1 ]] || { echo "usage: formation ask <question>" >&2; exit 2; }
+  local from; from="$(self_id)"
+  local to="${FORMATION_PARENT:-lead}"
+  local msg="[ASK] $*"
+  mailbox_send "$from" "$to" "$msg"
+  line_push "[formation/$from] $msg  (reply via /rc formation-$from)"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  spawn)  cmd_spawn  "$@" ;;
+  msg)    cmd_msg    "$@" ;;
+  status) cmd_status "$@" ;;
+  inbox)  cmd_inbox  "$@" ;;
+  reap)   cmd_reap   "$@" ;;
+  report) cmd_report "$@" ;;
+  done)   cmd_done   "$@" ;;
+  ask)    cmd_ask    "$@" ;;
+  help|-h|--help) usage ;;
+  *) echo "unknown: $cmd" >&2; usage; exit 2 ;;
+esac
