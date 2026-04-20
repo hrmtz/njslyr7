@@ -1,5 +1,7 @@
 # njslyr7
 
+English | [日本語](README_ja.md)
+
 A minimal orchestration layer for spawning long-running peer Claude Code
 workers in sibling tmux panes. Ships as the `formation` CLI and a Claude Code
 skill that knows when and how to use it.
