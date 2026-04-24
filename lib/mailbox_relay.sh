@@ -8,11 +8,11 @@
 #
 # 使い方 (各 pane の裏で独立 daemon として走らせる):
 #
-#   # main pane 用 (main 宛の msg を main tmux pane に inject):
-#   nohup bash $NJSLYR_HOME/../lib/mailbox_relay.sh main main > /tmp/relay_main.log 2>&1 &
+#   # main-5 pane 用 (main-5 宛の msg を main-5 tmux pane に inject):
+#   nohup bash lib/mailbox_relay.sh main-5 main-5 > /tmp/relay_main5.log 2>&1 &
 #
-#   # worker pane 用:
-#   nohup bash .../mailbox_relay.sh worker-A worker-pane > /tmp/relay_worker_a.log 2>&1 &
+#   # qdrant-parallel pane 用:
+#   nohup bash lib/mailbox_relay.sh qdrant-parallel qdrant-exp > /tmp/relay_qdrant.log 2>&1 &
 #
 # 第 1 引数: mailbox 上の agent 名 (msg の "to" field で filter)
 # 第 2 引数: tmux session/pane 名 (send-keys 対象)
@@ -53,6 +53,10 @@ process_new_lines() {
     # inject into tmux pane
     # use a short prompt that triggers agent to tail the mailbox
     tmux send-keys -t "$PANE" "mailbox: 新着 from $from — '$subj' (tail -1 ~/.njslyr7/mailbox/log.jsonl で内容確認して reply)" Enter 2>&1 | tail -2
+    # multiagent-njslyr 既知問題: Claude Code の text area で 1 回 Enter だけだと submit されず input 留まる。
+    # 時間差で Enter 2 度打ちして force submit。
+    sleep 0.5
+    tmux send-keys -t "$PANE" Enter 2>&1 | tail -1
     sleep 1  # debounce、連続 msg で burst 防ぐ
   done
   LAST=$current
