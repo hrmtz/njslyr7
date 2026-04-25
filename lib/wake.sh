@@ -23,3 +23,13 @@ wake_paste() {
   tmux paste-buffer -t "$pane_id" -b "$buf" -d
   tmux send-keys -t "$pane_id" Enter
 }
+
+# Send text to a pane and force-submit. Claude Code's text area can swallow
+# a single Enter and leave the message un-submitted; double-tapping with a
+# delay reliably submits. Shared by `formation msg` and the mailbox relay.
+tmux_send_submit() {
+  local pane_id="$1" text="$2"
+  tmux send-keys -t "$pane_id" "$text" Enter
+  sleep 0.5
+  tmux send-keys -t "$pane_id" Enter
+}

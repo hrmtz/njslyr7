@@ -22,6 +22,10 @@
 
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/wake.sh"
+
 AGENT="${1:?agent name required (msg 'to' field value)}"
 PANE="${2:?tmux session/pane target}"
 NJSLYR_HOME="${NJSLYR_HOME:-$HOME/.njslyr7}"
@@ -50,13 +54,7 @@ process_new_lines() {
     subj=$(echo "$line" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('subject',''))" 2>/dev/null)
     from=$(echo "$line" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('from',''))" 2>/dev/null)
     echo "$LOG_PREFIX new msg from=$from subj=$(echo "$subj" | head -c 60), injecting into $PANE"
-    # inject into tmux pane
-    # use a short prompt that triggers agent to tail the mailbox
-    tmux send-keys -t "$PANE" "mailbox: 新着 from $from — '$subj' (tail -1 ~/.njslyr7/mailbox/log.jsonl で内容確認して reply)" Enter 2>&1 | tail -2
-    # multiagent-njslyr 既知問題: Claude Code の text area で 1 回 Enter だけだと submit されず input 留まる。
-    # 時間差で Enter 2 度打ちして force submit。
-    sleep 0.5
-    tmux send-keys -t "$PANE" Enter 2>&1 | tail -1
+    tmux_send_submit "$PANE" "mailbox: 新着 from $from — '$subj' (tail -1 ~/.njslyr7/mailbox/log.jsonl で内容確認して reply)"
     sleep 1  # debounce、連続 msg で burst 防ぐ
   done
   LAST=$current
