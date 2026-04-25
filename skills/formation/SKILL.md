@@ -287,16 +287,18 @@ worker never promotes on its own.
   row).
 - **Worker pane appears unresponsive after a `formation msg`**: Claude Code's
   text area can swallow a single Enter and leave the message un-submitted.
-  The relay daemon already double-taps Enter with a 0.5 s delay to force
-  submission; if a manual `tmux send-keys ... Enter` looks stuck, reproduce
-  the same pattern (a second Enter after a short sleep). If you have an old
-  installation that pre-dates this fix, re-run `bash
-  ~/.claude/skills/formation/install.sh` (or the project's `install.sh`).
+  Both `formation msg` and the relay daemon double-tap Enter with a 0.5 s
+  delay to force submission. If a hand-rolled `tmux send-keys ... Enter`
+  looks stuck, reproduce the same pattern (a second Enter after a short
+  sleep). If your installation pre-dates this fix, re-run the project's
+  `install.sh` from your njslyr7 clone.
 - **Mailbox has a new entry but the worker isn't reading it**: the relay
   daemon may have died. Check with `ps aux | grep mailbox_relay | grep
-  <worker_id>`. If absent, restart it manually:
+  <worker_id>`. If absent, restart it manually (the lib path is derived
+  from `formation` itself so this works regardless of where the repo lives):
   ```bash
-  nohup bash ~/projects/njslyr7/lib/mailbox_relay.sh <worker_id> <pane_id> \
+  LIB="$(dirname "$(readlink -f "$(command -v formation)")")/../lib"
+  nohup bash "$LIB/mailbox_relay.sh" <worker_id> <pane_id> \
     > /tmp/njslyr7_relay_<worker_id>.log 2>&1 &
   echo $! > ~/.njslyr7/formation/<worker_id>.relay_pid
   ```

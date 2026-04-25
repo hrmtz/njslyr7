@@ -189,9 +189,22 @@ EOF
   local relay_pid_file="$FORMATION_DIR/$name.relay_pid"
   nohup bash "$LIB_DIR/mailbox_relay.sh" "$name" "$pane_id" \
     > "$relay_log" 2>&1 &
-  echo $! > "$relay_pid_file"
+  local relay_pid=$!
+  echo "$relay_pid" > "$relay_pid_file"
 
-  echo "$name  pane=$pane_id  session=$session_name  relay_pid=$(cat "$relay_pid_file") log=$relay_log"
+  # Healthcheck: confirm the relay daemon is still alive a moment later.
+  # Common failure: lib/mailbox_relay.sh missing on disk, or a syntax error
+  # there. The nohup launch returns 0 either way, so without this check the
+  # spawn output would falsely report relay_pid=NNN.
+  sleep 0.3
+  if ! kill -0 "$relay_pid" 2>/dev/null; then
+    echo "warn: relay daemon for $name died immediately; tail $relay_log" >&2
+    rm -f "$relay_pid_file"
+    echo "$name  pane=$pane_id  session=$session_name  relay=DEAD log=$relay_log"
+    return 1
+  fi
+
+  echo "$name  pane=$pane_id  session=$session_name  relay_pid=$relay_pid log=$relay_log"
 }
 
 cmd_msg() {
@@ -205,7 +218,7 @@ cmd_msg() {
   local row; row="$(registry_get "$worker_id")"
   [[ -n "$row" ]] || { echo "no such worker: $worker_id" >&2; exit 2; }
   local pane_id; pane_id="$(echo "$row" | jq -r '.pane_id')"
-  tmux send-keys -t "$pane_id" "$text" Enter
+  tmux_send_submit "$pane_id" "$text"
 }
 
 cmd_status() {
@@ -246,9 +259,11 @@ cmd_reap() {
   if [[ -f "$relay_pid_file" ]]; then
     local rpid; rpid="$(cat "$relay_pid_file" 2>/dev/null || true)"
     if [[ -n "$rpid" ]]; then
-      kill "$rpid" 2>/dev/null || true
-      # also catch the inotifywait child
+      # Order matters: kill the inotifywait child first while its parent
+      # bash is still alive so pkill -P can find it. If we kill bash first,
+      # inotifywait gets reparented to init and leaks past reap.
       pkill -P "$rpid" 2>/dev/null || true
+      kill "$rpid" 2>/dev/null || true
     fi
     rm -f "$relay_pid_file"
   fi
