@@ -181,7 +181,17 @@ EOF
   tmux send-keys -t "$pane_id" "$seed" Enter
 
   registry_add "$name" "$pane_id" "$session_name" "$briefing"
-  echo "$name  pane=$pane_id  session=$session_name"
+
+  # Auto-start mailbox relay daemon: inotifywait on mailbox, inject new msgs
+  # addressed to this worker into its tmux pane. Without this, the worker
+  # only notices new mailbox entries when it idly polls; user has to poke.
+  local relay_log="/tmp/njslyr7_relay_${name}.log"
+  local relay_pid_file="$FORMATION_DIR/$name.relay_pid"
+  nohup bash "$LIB_DIR/mailbox_relay.sh" "$name" "$pane_id" \
+    > "$relay_log" 2>&1 &
+  echo $! > "$relay_pid_file"
+
+  echo "$name  pane=$pane_id  session=$session_name  relay_pid=$(cat "$relay_pid_file") log=$relay_log"
 }
 
 cmd_msg() {
@@ -229,6 +239,20 @@ cmd_reap() {
   local row; row="$(registry_get "$worker_id")"
   [[ -n "$row" ]] || { echo "no such worker: $worker_id" >&2; exit 2; }
   local pane_id; pane_id="$(echo "$row" | jq -r '.pane_id')"
+
+  # Stop relay daemon first; otherwise it keeps inotifywait open on a
+  # pane that is about to die.
+  local relay_pid_file="$FORMATION_DIR/$worker_id.relay_pid"
+  if [[ -f "$relay_pid_file" ]]; then
+    local rpid; rpid="$(cat "$relay_pid_file" 2>/dev/null || true)"
+    if [[ -n "$rpid" ]]; then
+      kill "$rpid" 2>/dev/null || true
+      # also catch the inotifywait child
+      pkill -P "$rpid" 2>/dev/null || true
+    fi
+    rm -f "$relay_pid_file"
+  fi
+
   tmux kill-pane -t "$pane_id" 2>/dev/null || true
   registry_remove "$worker_id"
   rm -f "$MAILBOX_CURSOR_DIR/$worker_id.txt"
